@@ -77,15 +77,40 @@ const result=await user.toArray()
 
 
 
+app.get('/public/recent-equipments', async (req, res) => {
+  try {
+    const result = await equipments
+      .find({ status: "Approved" })
+      .sort({ createdAt: -1 })
+      .limit(4)
+      .toArray();
 
+    res.status(200).send(result);
+  } catch (error) {
+    console.error("Recently added equipment error:", error);
+
+    res.status(500).send({
+      message: "Failed to fetch recently added equipment",
+    });
+  }
+}); 
 
 
 
 
 //ower
 
+
+
+
 app.post('/equipments',async(req,res)=>{
-  const job = req.body;
+  // Stamp new listings so the public catalogue can order them by creation
+  // time. Older documents without this field are handled by the sort in
+  // GET /public/equipments via the _id tiebreaker.
+  const job = {
+    ...req.body,
+    createdAt: new Date().toISOString()
+  };
     const result = await equipments.insertOne(job);
     res.send(result);
 })
@@ -173,23 +198,40 @@ app.get('/public/equipments', async (req, res) => {
     }
 
     // Sorting
-    let sortQuery = {};
+    let sortQuery = { _id: -1 };
 
-    if (req.query.sort === 'price_asc') {
+    if (req.query.sort === 'recent') {
+      // Newest listings first. createdAt is written when equipment is added;
+      // _id keeps older documents that predate it in newest-first order.
+      sortQuery = { createdAt: -1, _id: -1 };
+    }
+    else if (req.query.sort === 'price_asc') {
       sortQuery = { rentalPrice: 1 };
     }
     else if (req.query.sort === 'price_desc') {
       sortQuery = { rentalPrice: -1 };
     }
-    else {
-      sortQuery = { _id: -1 };
-    }
+
+    // Optional result cap (e.g. the homepage featured section asks for 6).
+    // Applying .limit() here keeps the cap in the MongoDB query itself instead
+    // of fetching every approved item and trimming it on the client.
+    // The cap protects the public endpoint from unbounded requests.
+    const rawLimit = getQueryString(req.query.limit);
+    const requestedLimit = Number(rawLimit);
+    const limit =
+      rawLimit && Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(Math.floor(requestedLimit), 50)
+        : 0;
 
     const cursor = equipments.find(query);
 
-    const result = await cursor
-      .sort(sortQuery)
-      .toArray();
+    let resultQuery = cursor.sort(sortQuery);
+
+    if (limit > 0) {
+      resultQuery = resultQuery.limit(limit);
+    }
+
+    const result = await resultQuery.toArray();
 
     res.send(result);
 
@@ -198,6 +240,41 @@ app.get('/public/equipments', async (req, res) => {
 
     res.status(500).send({
       message: 'Failed to fetch equipment'
+    });
+  }
+});
+
+
+// Approved-equipment counts per stored category. The grouping and counting
+// happen in MongoDB so the client never has to download the whole catalogue.
+app.get('/public/categories', async (req, res) => {
+  try {
+    const result = await equipments
+      .aggregate([
+        { $match: { status: { $regex: /^approved$/i } } },
+        {
+          $group: {
+            _id: '$category',
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            category: { $ifNull: ['$_id', 'Other'] },
+            count: 1
+          }
+        },
+        { $sort: { count: -1, category: 1 } }
+      ])
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.log(error);
+
+    res.status(500).send({
+      message: 'Failed to fetch equipment categories'
     });
   }
 });
