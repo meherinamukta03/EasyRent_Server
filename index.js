@@ -31,6 +31,12 @@ const users=database.collection('user')
 const equipments=database.collection('equipments')
 
 const rentalsCollection = database.collection("rentals");
+const favoritesCollection = database.collection("favorites");
+
+// One favorite per equipment per customer.
+favoritesCollection
+  .createIndex({ customerEmail: 1, equipmentId: 1 }, { unique: true })
+  .catch((error) => console.log("Favorites index:", error.message));
 
 
 
@@ -70,20 +76,118 @@ app.post('/equipments',async(req,res)=>{
     res.send(result);
 })
 
-app.get("/equipments", async (req, res) => {
-  try {
-    const email = req.query.email;
+function getQueryString(value) {
+  if (Array.isArray(value)) {
+    return String(value[0] ?? "").trim();
+  }
 
-    const result = await equipments.find({ "ownerInfo.email": email })
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+
+app.get("/equipments", async (req, res) => {
+  const email = req.query.email;
+
+  const result = await equipments.find({
+    "ownerInfo.email": email
+  }).toArray();
+
+  res.send(result);
+});
+
+app.get('/public/equipments', async (req, res) => {
+  try {
+    const query = {};
+
+    // Only approved equipment
+    query.status = {
+      $regex: /^approved$/i
+    };
+
+    // Search by equipment name and location
+    if (req.query.search) {
+      query.$or = [
+        {
+          name: {
+            $regex: req.query.search,
+            $options: 'i'
+          }
+        },
+        {
+          location: {
+            $regex: req.query.search,
+            $options: 'i'
+          }
+        }
+      ];
+    }
+
+   
+    if (req.query.category) {
+      query.category = req.query.category;
+    }
+
+    // Filter by rental type
+    if (req.query.rentalType) {
+      query.rentalType = req.query.rentalType;
+    }
+
+    // Filter by price range
+    if (req.query.minPrice || req.query.maxPrice) {
+      query.rentalPrice = {};
+
+      if (req.query.minPrice) {
+        query.rentalPrice.$gte = Number(req.query.minPrice);
+      }
+
+      if (req.query.maxPrice) {
+        query.rentalPrice.$lte = Number(req.query.maxPrice);
+      }
+    }
+
+    // Filter by availability
+    if (req.query.availability === 'Available') {
+      query.quantity = { $gt: 0 };
+    }
+
+    if (req.query.availability === 'Unavailable') {
+      query.quantity = { $lte: 0 };
+    }
+
+    // Sorting
+    let sortQuery = {};
+
+    if (req.query.sort === 'price_asc') {
+      sortQuery = { rentalPrice: 1 };
+    }
+    else if (req.query.sort === 'price_desc') {
+      sortQuery = { rentalPrice: -1 };
+    }
+    else {
+      sortQuery = { _id: -1 };
+    }
+
+    const cursor = equipments.find(query);
+
+    const result = await cursor
+      .sort(sortQuery)
       .toArray();
 
     res.send(result);
+
   } catch (error) {
+    console.log(error);
+
     res.status(500).send({
-      message: "Failed to get equipment",
+      message: 'Failed to fetch equipment'
     });
   }
 });
+
 
 app.patch('/equipments/:id', async (req, res) => {
   try {
@@ -239,6 +343,403 @@ app.get("/owner/rentals", async (req, res) => {
   }
 });
 
+
+// ---------------------------------------------------------------------------
+// Customer favorites
+// ---------------------------------------------------------------------------
+
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function getString(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+app.get("/favorites", async (req, res) => {
+  try {
+    const customerEmail = getQueryString(req.query.email);
+
+    if (!customerEmail) {
+      return res.status(400).send({ message: "Customer email is required" });
+    }
+
+    const equipmentId = getQueryString(req.query.equipmentId);
+    const query = { customerEmail };
+
+    if (equipmentId) query.equipmentId = equipmentId;
+
+    const result = await favoritesCollection
+      .find(query)
+      .sort({ _id: -1 })
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to fetch favorites" });
+  }
+});
+
+app.post("/favorites", async (req, res) => {
+  try {
+    const customerEmail = getString(req.body?.customerEmail);
+    const customerId = getString(req.body?.customerId);
+    const equipmentId = getString(req.body?.equipmentId);
+    const equipment = req.body?.equipment;
+
+    if (!customerEmail || !equipmentId || !equipment || typeof equipment !== "object") {
+      return res.status(400).send({ message: "Invalid favorite data" });
+    }
+
+    const existing = await favoritesCollection.findOne({ customerEmail, equipmentId });
+
+    if (existing) {
+      return res.send({ message: "Already in favorites", favorite: existing });
+    }
+
+    const favorite = {
+      customerEmail,
+      ...(customerId ? { customerId } : {}),
+      equipmentId,
+      equipment,
+      createdAt: new Date().toISOString(),
+    };
+
+    const result = await favoritesCollection.insertOne(favorite);
+
+    res.status(201).send({
+      message: "Added to favorites",
+      favorite: { ...favorite, _id: result.insertedId },
+    });
+  } catch (error) {
+    if (error?.code === 11000) {
+      return res.send({ message: "Already in favorites" });
+    }
+
+    console.log(error);
+    res.status(500).send({ message: "Failed to add favorite" });
+  }
+});
+
+app.delete("/favorites", async (req, res) => {
+  try {
+    const customerEmail = getQueryString(req.query.email);
+    const equipmentId = getQueryString(req.query.equipmentId);
+
+    if (!customerEmail || !equipmentId) {
+      return res.status(400).send({ message: "Invalid favorite data" });
+    }
+
+    const result = await favoritesCollection.deleteOne({ customerEmail, equipmentId });
+
+    res.send({
+      message: "Removed from favorites",
+      deletedCount: result.deletedCount,
+    });
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to remove favorite" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bookings
+// ---------------------------------------------------------------------------
+
+function calculateRental(equipment, start, end, quantity) {
+  const days = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / 86_400_000));
+  const rentalType = String(equipment.rentalType || "Daily").toLowerCase();
+
+  let duration = days;
+  if (rentalType === "weekly") duration = Math.max(1, Math.ceil(days / 7));
+  if (rentalType === "monthly") duration = Math.max(1, Math.ceil(days / 30));
+
+  return {
+    rentalDuration: duration,
+    rentalDays: days,
+    totalAmount: Number(equipment.rentalPrice) * duration * quantity,
+  };
+}
+
+function validateBookingInput(body) {
+  const equipmentId = getString(body?.equipmentId);
+  const customerEmail = getString(body?.customerEmail);
+  const startValue = getString(body?.rentalStartDate);
+  const endValue = getString(body?.rentalEndDate);
+  const requiredQuantity = Number(body?.requiredQuantity);
+  const contactNumber = getString(body?.contactNumber);
+  const deliveryAddress = getString(body?.deliveryAddress);
+
+  if (!ObjectId.isValid(equipmentId)) {
+    throw new ApiError(400, "A valid equipment ID is required");
+  }
+  if (!customerEmail) {
+    throw new ApiError(401, "You must be signed in to book equipment");
+  }
+
+  const start = new Date(startValue);
+  const end = new Date(endValue);
+
+  if (!startValue || Number.isNaN(start.getTime())) {
+    throw new ApiError(400, "A valid rental start date is required");
+  }
+  if (!endValue || Number.isNaN(end.getTime())) {
+    throw new ApiError(400, "A valid rental end date is required");
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const startDate = new Date(start);
+  startDate.setHours(0, 0, 0, 0);
+
+  if (startDate < today) {
+    throw new ApiError(400, "Rental start date cannot be in the past");
+  }
+  if (end <= start) {
+    throw new ApiError(400, "Rental end date must be after the start date");
+  }
+  if (!Number.isInteger(requiredQuantity) || requiredQuantity < 1) {
+    throw new ApiError(400, "Required quantity must be a positive whole number");
+  }
+  if (!/^\d{7,15}$/.test(contactNumber.replace(/[\s-]/g, ""))) {
+    throw new ApiError(400, "Enter a valid contact number");
+  }
+  if (deliveryAddress.length < 5) {
+    throw new ApiError(400, "Enter a valid delivery address");
+  }
+
+  return {
+    equipmentId,
+    customerEmail,
+    customerId: getString(body?.customerId),
+    customerName: getString(body?.customerName),
+    start,
+    end,
+    requiredQuantity,
+    contactNumber,
+    deliveryAddress,
+    notes: getString(body?.notes),
+  };
+}
+
+app.post("/bookings", async (req, res) => {
+  const session = client.startSession();
+
+  try {
+    const input = validateBookingInput(req.body);
+    let booking = null;
+
+    await session.withTransaction(
+      async () => {
+        const equipment = await equipments.findOne(
+          { _id: new ObjectId(input.equipmentId) },
+          { session }
+        );
+
+        if (!equipment || !/^approved$/i.test(String(equipment.status || ""))) {
+          throw new ApiError(404, "Equipment not found");
+        }
+
+        const stock = Number(equipment.quantity || 0);
+
+        if (stock < 1) {
+          throw new ApiError(409, "This equipment is currently unavailable");
+        }
+
+        const startISO = input.start.toISOString();
+        const endISO = input.end.toISOString();
+
+        // Overlapping bookings still reserve stock for their whole period.
+        const activeBookings = await rentalsCollection
+          .find(
+            {
+              equipmentId: new ObjectId(input.equipmentId),
+              bookingStatus: { $nin: ["Cancelled", "Rejected", "Completed"] },
+              rentalStartDate: { $lte: endISO },
+              rentalEndDate: { $gte: startISO },
+            },
+            { session }
+          )
+          .toArray();
+
+        const reserved = activeBookings.reduce(
+          (total, item) => total + Number(item.requiredQuantity || 0),
+          0
+        );
+
+        if (reserved + input.requiredQuantity > stock) {
+          throw new ApiError(
+            409,
+            `Only ${Math.max(0, stock - reserved)} unit(s) available for this period`
+          );
+        }
+
+        const { rentalDuration, rentalDays, totalAmount } = calculateRental(
+          equipment,
+          input.start,
+          input.end,
+          input.requiredQuantity
+        );
+
+        const document = {
+          equipmentId: new ObjectId(input.equipmentId),
+          equipmentIdString: input.equipmentId,
+          equipmentName: equipment.name,
+          equipmentImage: equipment.image || "",
+          customerEmail: input.customerEmail,
+          customerId: input.customerId || undefined,
+          customerName: input.customerName || undefined,
+          ownerEmail: equipment.ownerInfo?.email || "",
+          rentalStartDate: startISO,
+          rentalEndDate: endISO,
+          rentalDays,
+          rentalDuration,
+          rentalType: equipment.rentalType || "Daily",
+          requiredQuantity: input.requiredQuantity,
+          rentalPrice: Number(equipment.rentalPrice || 0),
+          totalAmount,
+          contactNumber: input.contactNumber,
+          deliveryAddress: input.deliveryAddress,
+          notes: input.notes,
+          bookingStatus: "Pending",
+          paymentStatus: "Pending",
+          createdAt: new Date().toISOString(),
+        };
+
+        const result = await rentalsCollection.insertOne(document, { session });
+
+        booking = { ...document, _id: result.insertedId };
+      },
+      {
+        readConcern: { level: "snapshot" },
+        writeConcern: { w: "majority" },
+      }
+    );
+
+    res.status(201).send({ message: "Booking created successfully", booking });
+  } catch (error) {
+    if (error instanceof ApiError) {
+      return res.status(error.status).send({ message: error.message });
+    }
+
+    console.log(error);
+    res.status(500).send({ message: "Failed to create booking" });
+  } finally {
+    await session.endSession();
+  }
+});
+
+app.get("/customer/rentals", async (req, res) => {
+  try {
+    const customerEmail = getQueryString(req.query.email);
+
+    if (!customerEmail) {
+      return res.status(400).send({ message: "Customer email is required" });
+    }
+
+    const result = await rentalsCollection
+      .find({ customerEmail })
+      .sort({ _id: -1 })
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.log(error);
+    res.status(500).send({ message: "Failed to fetch rentals" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Public equipment details and availability
+// ---------------------------------------------------------------------------
+
+app.get("/public/equipments/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid equipment ID" });
+    }
+
+    const equipment = await equipments.findOne({
+      _id: new ObjectId(id),
+      status: { $regex: /^approved$/i },
+    });
+
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
+
+    res.send(equipment);
+  } catch (error) {
+    console.log(error);
+
+    res.status(500).send({ message: "Failed to fetch equipment" });
+  }
+});
+
+app.get("/public/equipments/:id/availability", async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid equipment ID" });
+    }
+
+    const equipment = await equipments.findOne({
+      _id: new ObjectId(id),
+      status: { $regex: /^approved$/i },
+    });
+
+    if (!equipment) {
+      return res.status(404).send({ message: "Equipment not found" });
+    }
+
+    const start = new Date(getString(req.query.start));
+    const end = new Date(getString(req.query.end));
+
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end <= start
+    ) {
+      return res.status(400).send({
+        message: "Valid start and end dates are required",
+      });
+    }
+
+    const activeBookings = await rentalsCollection
+      .find({
+        equipmentId: new ObjectId(id),
+        bookingStatus: { $nin: ["Cancelled", "Rejected", "Completed"] },
+        rentalStartDate: { $lte: start.toISOString() },
+        rentalEndDate: { $gte: end.toISOString() },
+      })
+      .toArray();
+
+    const reserved = activeBookings.reduce(
+      (total, item) => total + Number(item.requiredQuantity || 0),
+      0
+    );
+    const stock = Number(equipment.quantity || 0);
+    const availableQuantity = Math.max(0, stock - reserved);
+
+    res.send({
+      stock,
+      reserved,
+      availableQuantity,
+      available: availableQuantity > 0,
+    });
+  } catch (error) {
+    console.log(error);
+
+    res.status(500).send({ message: "Failed to check availability" });
+  }
+});
 
 app.listen(port, () => {
   console.log(`server is running on port ${port}`);
