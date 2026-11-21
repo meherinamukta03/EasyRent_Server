@@ -46,11 +46,83 @@ const equipments=database.collection('equipments')
 const rentalsCollection = database.collection("rentals");
 const favoritesCollection = database.collection("favorites");
 const paymentsCollection = database.collection("payments");
+const contactMessagesCollection = database.collection("contactMessages");
 
 // One favorite per equipment per customer.
 favoritesCollection
   .createIndex({ customerEmail: 1, equipmentId: 1 }, { unique: true })
   .catch((error) => console.log("Favorites index:", error.message));
+
+// One payment record per Stripe Checkout Session. Combined with the
+// $setOnInsert upsert in the webhook, this prevents duplicate payments.
+paymentsCollection
+  .createIndex({ stripeSessionId: 1 }, { unique: true, sparse: true })
+  .catch((error) => console.log("Payments index:", error.message));
+
+/**
+ * Advances booking status based on the rental dates. Confirmed bookings
+ * become Active when the start date arrives and Completed after the end date.
+ * Cancelled, Rejected and Refunded bookings are never touched.
+ */
+async function syncRentalProgress() {
+  const now = new Date().toISOString();
+
+  await rentalsCollection.updateMany(
+    { bookingStatus: "Confirmed", rentalStartDate: { $lte: now } },
+    { $set: { bookingStatus: "Active", updatedAt: now } }
+  );
+
+  await rentalsCollection.updateMany(
+    { bookingStatus: "Active", rentalEndDate: { $lte: now } },
+    { $set: { bookingStatus: "Completed", updatedAt: now } }
+  );
+}
+
+/** Writes payment details once and keeps the rental document in sync. */
+async function recordPaidBooking(booking, session, currency, paidAt) {
+  const paymentIntentId = session.payment_intent || "";
+
+  const updated = await rentalsCollection.findOneAndUpdate(
+    {
+      _id: booking._id,
+      paymentStatus: { $nin: ["Paid", "Refunded"] },
+    },
+    {
+      $set: {
+        paymentStatus: "Paid",
+        stripePaymentIntentId: paymentIntentId,
+        paidAt,
+        updatedAt: paidAt,
+      },
+    },
+    { returnDocument: "after" }
+  );
+
+  if (!updated) {
+    return false;
+  }
+
+  await paymentsCollection.updateOne(
+    { stripeSessionId: session.id },
+    {
+      $setOnInsert: {
+        bookingId: booking._id,
+        customerId: booking.customerId || "",
+        customerEmail: booking.customerEmail || "",
+        equipmentId: (booking.equipmentIdString || booking.equipmentId || "").toString(),
+        amount: booking.totalAmount,
+        currency,
+        paymentStatus: "Paid",
+        stripeSessionId: session.id,
+        stripePaymentIntentId: paymentIntentId,
+        created: paidAt,
+      },
+    },
+    { upsert: true }
+  );
+
+  return true;
+}
 
 
 
@@ -279,6 +351,57 @@ app.get('/public/categories', async (req, res) => {
   }
 });
 
+// Public contact form. Messages are stored in MongoDB and never expose
+// database details to the caller.
+app.post('/public/contact', async (req, res) => {
+  try {
+    const name = getString(req.body?.name);
+    const email = getString(req.body?.email);
+    const subject = getString(req.body?.subject);
+    const message = getString(req.body?.message);
+
+    if (name.length < 2 || name.length > 100) {
+      return res.status(400).send({ message: 'Please enter your full name' });
+    }
+
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).send({ message: 'Please enter a valid email address' });
+    }
+
+    if (subject.length < 3 || subject.length > 200) {
+      return res.status(400).send({ message: 'Please enter a subject' });
+    }
+
+    if (message.length < 10 || message.length > 2000) {
+      return res.status(400).send({
+        message: 'Please write a message of at least 10 characters'
+      });
+    }
+
+    const document = {
+      name,
+      email,
+      subject,
+      message,
+      status: 'New',
+      createdAt: new Date().toISOString(),
+    };
+
+    const result = await contactMessagesCollection.insertOne(document);
+
+    res.status(201).send({
+      message: 'Your message has been sent successfully.',
+      id: result.insertedId.toString(),
+    });
+  } catch (error) {
+    console.error('Contact message error:', error);
+
+    res.status(500).send({
+      message: 'Failed to send your message. Please try again.'
+    });
+  }
+});
+
 
 app.patch('/equipments/:id', async (req, res) => {
   try {
@@ -407,6 +530,8 @@ app.delete('/equipments/:id', async (req, res) => {
 app.get("/owner/rentals", async (req, res) => {
   try {
     const email = req.query.email;
+
+    await syncRentalProgress();
 
    
     const ownerEquipments = await equipments.find({ "ownerInfo.email": email })
@@ -569,103 +694,192 @@ function toStripeMinorUnits(amount, currency) {
 }
 
 /**
- * Verifies the webhook signature, matches the session to a stored booking,
- * confirms the paid amount/currency, marks the booking paid, and records the
- * transaction in the payments collection. Safe to call more than once.
+ * When no webhook signing secret is configured, re-fetch the event object
+ * from Stripe itself. The payload is only used for the event id/type; all
+ * status, amount and currency values come from Stripe's API, so a forged
+ * payload cannot mark a booking as paid.
+ */
+async function resolveStripeEventObject(payload) {
+  const type = payload?.type;
+  const objectId = payload?.data?.object?.id;
+
+  if (!type || !objectId) return null;
+
+  if (type === 'checkout.session.completed' || type === 'checkout.session.expired') {
+    return await stripe.checkout.sessions.retrieve(objectId);
+  }
+  if (type === 'payment_intent.payment_failed') {
+    return await stripe.paymentIntents.retrieve(objectId);
+  }
+  if (type === 'charge.refunded') {
+    return await stripe.charges.retrieve(objectId);
+  }
+
+  return null;
+}
+
+/**
+ * Verifies the webhook signature (or re-fetches from Stripe), matches the
+ * session to a stored booking, confirms the paid amount/currency, marks the
+ * booking paid, and records the transaction. Safe to call more than once.
  */
 async function handleStripeWebhook(req, res) {
-  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
-    return res.status(500).send({ message: 'Stripe webhook is not configured' });
+  if (!stripe) {
+    return res.status(500).send({ message: 'Stripe is not configured' });
   }
 
   let event;
   const signature = req.headers['stripe-signature'];
 
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,
-      signature,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (error) {
-    console.log('Stripe webhook signature error:', error.message);
-    return res.status(400).send({ message: `Webhook Error: ${error.message}` });
-  }
-
-  if (event.type !== 'checkout.session.completed') {
-    return res.send({ received: true });
-  }
-
-  const session = event.data.object;
-
-  if (session.payment_status !== 'paid') {
-    return res.send({ received: true });
-  }
-
-  const bookingId = session.metadata?.bookingId || session.client_reference_id;
-
-  if (!bookingId || !ObjectId.isValid(bookingId)) {
-    return res.status(400).send({ message: 'Invalid booking reference' });
-  }
-
-  const booking = await rentalsCollection.findOne({
-    _id: new ObjectId(bookingId),
-  });
-
-  if (!booking) {
-    return res.status(404).send({ message: 'Booking not found' });
-  }
-
-  if (booking.stripeSessionId !== session.id) {
-    return res.status(400).send({ message: 'Checkout session mismatch' });
-  }
-
-  const expectedCurrency = booking.stripeCurrency || STRIPE_CURRENCY;
-  const expectedAmount = toStripeMinorUnits(booking.totalAmount, expectedCurrency);
-
-  if (
-    session.currency !== expectedCurrency ||
-    session.amount_total !== expectedAmount
-  ) {
-    return res.status(400).send({ message: 'Payment amount mismatch' });
-  }
-
-  const paidAt = new Date().toISOString();
-
-  await rentalsCollection.updateOne(
-    { _id: booking._id },
-    {
-      $set: {
-        paymentStatus: 'Paid',
-        bookingStatus: 'Confirmed',
-        stripePaymentIntentId: session.payment_intent || '',
-        paidAt,
-        updatedAt: paidAt,
-      },
+  if (process.env.STRIPE_WEBHOOK_SECRET) {
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      console.log('Stripe webhook signature error:', error.message);
+      return res.status(400).send({ message: 'Invalid webhook signature' });
     }
-  );
+  } else {
+    try {
+      const payload = JSON.parse(req.body.toString());
+      const verifiedObject = await resolveStripeEventObject(payload);
 
-  // Upsert keeps webhook retries from creating duplicate payment records.
-  await paymentsCollection.updateOne(
-    { stripeSessionId: session.id },
-    {
-      $setOnInsert: {
-        bookingId: booking._id,
-        customerId: booking.customerId || '',
-        customerEmail: booking.customerEmail || '',
-        equipmentId: (booking.equipmentIdString || booking.equipmentId || '').toString(),
-        amount: booking.totalAmount,
-        currency: expectedCurrency,
-        paymentStatus: 'Paid',
-        stripeSessionId: session.id,
-        stripePaymentIntentId: session.payment_intent || '',
-        created: paidAt,
-      },
-    },
-    { upsert: true }
-  );
+      if (!verifiedObject) {
+        return res.send({ received: true });
+      }
 
-  return res.send({ received: true });
+      event = { type: payload.type, data: { object: verifiedObject } };
+    } catch (error) {
+      console.error('Stripe webhook fallback verification failed:', error.message);
+      return res.status(400).send({ message: 'Invalid webhook payload' });
+    }
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+
+      if (session.payment_status !== 'paid') {
+        return res.send({ received: true });
+      }
+
+      const bookingId = session.metadata?.bookingId || session.client_reference_id;
+
+      if (!bookingId || !ObjectId.isValid(bookingId)) {
+        return res.status(400).send({ message: 'Invalid booking reference' });
+      }
+
+      const booking = await rentalsCollection.findOne({
+        _id: new ObjectId(bookingId),
+      });
+
+      if (!booking) {
+        return res.status(404).send({ message: 'Booking not found' });
+      }
+
+      if (booking.stripeSessionId !== session.id) {
+        return res.status(400).send({ message: 'Checkout session mismatch' });
+      }
+
+      const expectedCurrency = booking.stripeCurrency || STRIPE_CURRENCY;
+      const expectedAmount = toStripeMinorUnits(booking.totalAmount, expectedCurrency);
+
+      if (
+        session.currency !== expectedCurrency ||
+        session.amount_total !== expectedAmount
+      ) {
+        return res.status(400).send({ message: 'Payment amount mismatch' });
+      }
+
+      const paidAt = new Date().toISOString();
+
+      // Only payment status changes here. Booking status stays Pending until
+      // the equipment owner explicitly accepts the booking.
+      await recordPaidBooking(booking, session, expectedCurrency, paidAt);
+
+      return res.send({ received: true });
+    }
+
+    if (event.type === 'checkout.session.expired') {
+      const session = event.data.object;
+      const bookingId = session.metadata?.bookingId || session.client_reference_id;
+
+      if (bookingId && ObjectId.isValid(bookingId)) {
+        await rentalsCollection.updateOne(
+          {
+            _id: new ObjectId(bookingId),
+            stripeSessionId: session.id,
+            paymentStatus: 'Pending',
+          },
+          { $set: { paymentStatus: 'Failed', updatedAt: new Date().toISOString() } }
+        );
+      }
+
+      return res.send({ received: true });
+    }
+
+    if (event.type === 'payment_intent.payment_failed') {
+      const paymentIntent = event.data.object;
+      const bookingId = paymentIntent.metadata?.bookingId;
+
+      if (bookingId && ObjectId.isValid(bookingId)) {
+        await rentalsCollection.updateOne(
+          {
+            _id: new ObjectId(bookingId),
+            paymentStatus: 'Pending',
+          },
+          {
+            $set: {
+              paymentStatus: 'Failed',
+              stripePaymentIntentId: paymentIntent.id || '',
+              updatedAt: new Date().toISOString(),
+            },
+          }
+        );
+      }
+
+      return res.send({ received: true });
+    }
+
+    if (event.type === 'charge.refunded') {
+      const charge = event.data.object;
+      const paymentIntentId = charge.payment_intent;
+
+      if (paymentIntentId) {
+        const refundedAt = new Date().toISOString();
+
+        await rentalsCollection.updateOne(
+          {
+            stripePaymentIntentId: paymentIntentId,
+            paymentStatus: 'Paid',
+          },
+          { $set: { paymentStatus: 'Refunded', updatedAt: refundedAt } }
+        );
+
+        await paymentsCollection.updateOne(
+          { stripePaymentIntentId: paymentIntentId },
+          {
+            $set: {
+              paymentStatus: 'Refunded',
+              refundedAt,
+              amountRefunded: charge.amount_refunded || 0,
+            },
+          }
+        );
+      }
+
+      return res.send({ received: true });
+    }
+
+    return res.send({ received: true });
+  } catch (error) {
+    console.error('Stripe webhook processing error:', error);
+
+    return res.status(500).send({ message: 'Failed to process webhook' });
+  }
 }
 
 function validateBookingInput(body) {
@@ -950,6 +1164,232 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
+/**
+ * Verifies a returned Stripe Checkout Session directly with Stripe before
+ * marking a booking paid. The success page is NEVER trusted on its own: the
+ * session id, booking id, amount and currency are all checked against Stripe
+ * and the stored booking. Safe to call repeatedly.
+ */
+app.post('/verify-payment', async (req, res) => {
+  try {
+    const bookingId = getString(req.body?.bookingId);
+    const sessionId = getString(req.body?.sessionId);
+    const customerEmail = getString(req.body?.customerEmail);
+
+    if (!bookingId || !ObjectId.isValid(bookingId) || !sessionId || !customerEmail) {
+      return res.status(400).send({ message: 'Invalid payment verification request' });
+    }
+
+    if (!stripe) {
+      return res.status(500).send({ message: 'Stripe is not configured' });
+    }
+
+    const booking = await rentalsCollection.findOne({
+      _id: new ObjectId(bookingId),
+      customerEmail,
+    });
+
+    if (!booking) {
+      return res.status(404).send({ message: 'Booking not found' });
+    }
+
+    if (booking.stripeSessionId !== sessionId) {
+      return res.status(400).send({ message: 'Checkout session mismatch' });
+    }
+
+    if (booking.paymentStatus === 'Paid' || booking.paymentStatus === 'Refunded') {
+      return res.send({
+        paymentStatus: booking.paymentStatus,
+        bookingStatus: booking.bookingStatus,
+        alreadyVerified: true,
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (
+      session.client_reference_id !== bookingId &&
+      session.metadata?.bookingId !== bookingId
+    ) {
+      return res.status(400).send({ message: 'Checkout session mismatch' });
+    }
+
+    const expectedCurrency = booking.stripeCurrency || STRIPE_CURRENCY;
+    const expectedAmount = toStripeMinorUnits(booking.totalAmount, expectedCurrency);
+
+    const paid =
+      session.payment_status === 'paid' &&
+      session.status === 'complete' &&
+      session.currency === expectedCurrency &&
+      session.amount_total === expectedAmount;
+
+    if (!paid) {
+      if (session.status === 'expired' && booking.paymentStatus === 'Pending') {
+        await rentalsCollection.updateOne(
+          { _id: booking._id, paymentStatus: 'Pending' },
+          { $set: { paymentStatus: 'Failed', updatedAt: new Date().toISOString() } }
+        );
+      }
+
+      return res.status(400).send({ message: 'Payment has not been confirmed by Stripe' });
+    }
+
+    await recordPaidBooking(booking, session, expectedCurrency, new Date().toISOString());
+
+    const updated = await rentalsCollection.findOne({ _id: booking._id });
+
+    return res.send({
+      paymentStatus: updated.paymentStatus,
+      bookingStatus: updated.bookingStatus,
+      alreadyVerified: false,
+    });
+  } catch (error) {
+    console.error('Payment verification error:', error);
+
+    return res.status(500).send({ message: 'Failed to verify payment' });
+  }
+});
+
+// Owner accepts a paid, pending booking. The ownerEmail filter makes the
+// update atomic and ensures only the owner of the equipment can change it.
+app.post('/bookings/:id/accept', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const ownerEmail = getString(req.body?.ownerEmail);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: 'Invalid booking ID' });
+    }
+    if (!ownerEmail) {
+      return res.status(401).send({ message: 'Owner identity is required' });
+    }
+
+    const objectId = new ObjectId(id);
+    const now = new Date().toISOString();
+
+    const updated = await rentalsCollection.findOneAndUpdate(
+      {
+        _id: objectId,
+        ownerEmail,
+        paymentStatus: 'Paid',
+        bookingStatus: 'Pending',
+      },
+      { $set: { bookingStatus: 'Confirmed', acceptedAt: now, updatedAt: now } },
+      { returnDocument: 'after' }
+    );
+
+    if (!updated) {
+      const existing = await rentalsCollection.findOne({ _id: objectId, ownerEmail });
+
+      if (!existing) {
+        return res.status(404).send({ message: 'Booking not found for this owner' });
+      }
+      if (existing.paymentStatus !== 'Paid') {
+        return res.status(409).send({ message: 'Payment must be completed before accepting' });
+      }
+      return res.status(409).send({ message: 'Only pending bookings can be accepted' });
+    }
+
+    return res.send({ message: 'Booking accepted successfully', booking: updated });
+  } catch (error) {
+    console.error('Accept booking error:', error);
+    return res.status(500).send({ message: 'Failed to accept booking' });
+  }
+});
+
+// Owner rejects an eligible pending booking. A Stripe refund is attempted for
+// paid bookings, and paymentStatus becomes Refunded only when Stripe confirms
+// the refund succeeded.
+app.post('/bookings/:id/reject', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const ownerEmail = getString(req.body?.ownerEmail);
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: 'Invalid booking ID' });
+    }
+    if (!ownerEmail) {
+      return res.status(401).send({ message: 'Owner identity is required' });
+    }
+
+    const objectId = new ObjectId(id);
+    const existing = await rentalsCollection.findOne({ _id: objectId, ownerEmail });
+
+    if (!existing) {
+      return res.status(404).send({ message: 'Booking not found for this owner' });
+    }
+    if (existing.bookingStatus !== 'Pending') {
+      return res.status(409).send({ message: 'Only pending bookings can be rejected' });
+    }
+
+    let paymentStatus = existing.paymentStatus;
+    let refundStatus = 'not_required';
+
+    if (existing.paymentStatus === 'Paid') {
+      if (!stripe || !existing.stripePaymentIntentId) {
+        refundStatus = 'unavailable';
+      } else {
+        try {
+          const refund = await stripe.refunds.create({
+            payment_intent: existing.stripePaymentIntentId,
+            reason: 'requested_by_customer',
+          });
+
+          if (refund.status === 'succeeded') {
+            paymentStatus = 'Refunded';
+            refundStatus = 'succeeded';
+
+            await paymentsCollection.updateOne(
+              { stripePaymentIntentId: existing.stripePaymentIntentId },
+              {
+                $set: {
+                  paymentStatus: 'Refunded',
+                  refundedAt: new Date().toISOString(),
+                  stripeRefundId: refund.id,
+                  amountRefunded: refund.amount || 0,
+                },
+              }
+            );
+          } else {
+            refundStatus = 'pending';
+          }
+        } catch (refundError) {
+          console.error('Stripe refund error:', refundError.message);
+          refundStatus = 'failed';
+        }
+      }
+    }
+
+    const now = new Date().toISOString();
+
+    const updated = await rentalsCollection.findOneAndUpdate(
+      { _id: objectId, ownerEmail, bookingStatus: 'Pending' },
+      {
+        $set: {
+          bookingStatus: 'Rejected',
+          paymentStatus,
+          rejectedAt: now,
+          updatedAt: now,
+        },
+      },
+      { returnDocument: 'after' }
+    );
+
+    if (!updated) {
+      return res.status(409).send({ message: 'This booking was already updated' });
+    }
+
+    return res.send({
+      message: 'Booking rejected successfully',
+      booking: updated,
+      refundStatus,
+    });
+  } catch (error) {
+    console.error('Reject booking error:', error);
+    return res.status(500).send({ message: 'Failed to reject booking' });
+  }
+});
+
 app.get("/customer/rentals", async (req, res) => {
   try {
     const customerEmail = getQueryString(req.query.email);
@@ -957,6 +1397,8 @@ app.get("/customer/rentals", async (req, res) => {
     if (!customerEmail) {
       return res.status(400).send({ message: "Customer email is required" });
     }
+
+    await syncRentalProgress();
 
     const result = await rentalsCollection
       .find({ customerEmail })
