@@ -354,21 +354,13 @@ app.get('/public/equipments', async (req, res) => {
       $regex: /^approved$/i
     };
 
-    // Search by equipment name and location
+    // Search by equipment title, category or location
     if (req.query.search) {
+      const pattern = escapeRegex(getQueryString(req.query.search));
       query.$or = [
-        {
-          name: {
-            $regex: req.query.search,
-            $options: 'i'
-          }
-        },
-        {
-          location: {
-            $regex: req.query.search,
-            $options: 'i'
-          }
-        }
+        { name: { $regex: pattern, $options: 'i' } },
+        { category: { $regex: pattern, $options: 'i' } },
+        { location: { $regex: pattern, $options: 'i' } },
       ];
     }
 
@@ -1986,6 +1978,62 @@ app.patch("/admin/rentals/:id/booking-status", ...adminAuth, async (req, res) =>
 // Analytics (JWT + role protected)
 // ---------------------------------------------------------------------------
 
+/** Last 12 UTC months as "YYYY-MM" keys, oldest first. */
+function recentMonthKeys() {
+  const now = new Date();
+  const keys = [];
+
+  for (let offset = 11; offset >= 0; offset--) {
+    const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - offset, 1));
+    keys.push(
+      `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`
+    );
+  }
+
+  return keys;
+}
+
+function monthKeyOf(value) {
+  const date = value instanceof Date ? value : new Date(String(value || ""));
+
+  if (Number.isNaN(date.getTime())) return null;
+
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+/** Builds a zero-filled 12-month series for bookings or earnings. */
+function monthlySeries(docs, getDate, getAmount) {
+  const keys = recentMonthKeys();
+  const buckets = new Map(
+    keys.map((key) => [key, { month: key, bookings: 0, amount: 0 }])
+  );
+
+  for (const doc of docs) {
+    const key = monthKeyOf(getDate(doc));
+
+    if (!key || !buckets.has(key)) continue;
+
+    const bucket = buckets.get(key);
+    bucket.bookings += 1;
+    bucket.amount += Number(getAmount(doc) || 0);
+  }
+
+  return keys.map((key) => {
+    const bucket = buckets.get(key);
+    const [year, month] = key.split("-");
+    const label = new Date(Date.UTC(Number(year), Number(month) - 1, 1)).toLocaleString(
+      "en-US",
+      { month: "short", year: "numeric", timeZone: "UTC" }
+    );
+
+    return { month: key, label, ...bucket };
+  });
+}
+
+function paymentDate(payment) {
+  return payment.created || payment.createdAt || payment.paidAt;
+}
+
 app.get('/owner/analytics', ...ownerAuth, async (req, res) => {
   try {
     const email = req.user.email;
@@ -1997,13 +2045,36 @@ app.get('/owner/analytics', ...ownerAuth, async (req, res) => {
       "ownerInfo.email": email,
     });
 
+    // Payments are joined through the booking id so only verified payments
+    // belonging to this owner's equipment are counted as earnings.
+    const paidPayments = await paymentsCollection
+      .find({ paymentStatus: "Paid" }, { projection: { bookingId: 1, amount: 1, created: 1, createdAt: 1 } })
+      .toArray();
+
+    const ownerBookingIds = new Set(rentals.map((item) => String(item._id)));
+    const ownerPayments = paidPayments.filter((payment) =>
+      ownerBookingIds.has(String(payment.bookingId))
+    );
+
+    const totalEarnings = ownerPayments.reduce(
+      (sum, payment) => sum + Number(payment.amount || 0),
+      0
+    );
+
     res.send({
       equipmentCount,
+      totalEquipment: equipmentCount,
       rentalCount: rentals.length,
+      totalBookings: rentals.length,
       pendingRequests: rentals.filter((item) => item.bookingStatus === "Pending").length,
-      earnings: rentals
-        .filter((item) => item.paymentStatus === "Paid")
-        .reduce((sum, item) => sum + Number(item.totalAmount || 0), 0),
+      completedRentals: rentals.filter((item) => item.bookingStatus === "Completed").length,
+      earnings: totalEarnings,
+      totalEarnings,
+      monthlyEarnings: monthlySeries(
+        ownerPayments,
+        paymentDate,
+        (payment) => payment.amount
+      ),
     });
   } catch (error) {
     return sendApiError(res, error, "Failed to load owner analytics");
@@ -2012,23 +2083,52 @@ app.get('/owner/analytics', ...ownerAuth, async (req, res) => {
 
 app.get('/admin/analytics', ...adminAuth, async (req, res) => {
   try {
-    const [userCount, pending, approved, rejected, rentalCount, paidRentals] =
+    const [userCount, equipmentDocs, rentalDocs, paidPayments] =
       await Promise.all([
         users.countDocuments({}),
-        equipments.countDocuments({ status: "Pending" }),
-        equipments.countDocuments({ status: "Approved" }),
-        equipments.countDocuments({ status: "Rejected" }),
-        rentalsCollection.countDocuments({}),
-        rentalsCollection.find({ paymentStatus: "Paid" }).toArray(),
+        equipments.find({}, { projection: { status: 1 } }).toArray(),
+        rentalsCollection
+          .find({}, { projection: { bookingStatus: 1, createdAt: 1, totalAmount: 1 } })
+          .toArray(),
+        paymentsCollection
+          .find(
+            { paymentStatus: "Paid" },
+            { projection: { amount: 1, created: 1, createdAt: 1 } }
+          )
+          .toArray(),
       ]);
+
+    const pending = equipmentDocs.filter((item) => String(item.status) === "Pending").length;
+    const approved = equipmentDocs.filter((item) => String(item.status) === "Approved").length;
+    const rejected = equipmentDocs.filter((item) => String(item.status) === "Rejected").length;
+
+    const revenue = paidPayments.reduce(
+      (sum, payment) => sum + Number(payment.amount || 0),
+      0
+    );
 
     res.send({
       userCount,
-      equipment: { pending, approved, rejected },
-      rentalCount,
-      revenue: paidRentals.reduce(
-        (sum, item) => sum + Number(item.totalAmount || 0),
-        0
+      totalUsers: userCount,
+      totalEquipment: equipmentDocs.length,
+      equipment: {
+        total: equipmentDocs.length,
+        pending,
+        approved,
+        rejected,
+      },
+      pendingApprovals: pending,
+      rentalCount: rentalDocs.length,
+      totalBookings: rentalDocs.length,
+      completedRentals: rentalDocs.filter(
+        (item) => item.bookingStatus === "Completed"
+      ).length,
+      revenue,
+      totalRevenue: revenue,
+      monthlyBookings: monthlySeries(
+        rentalDocs,
+        (rental) => rental.createdAt,
+        (rental) => rental.totalAmount
       ),
     });
   } catch (error) {
