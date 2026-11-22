@@ -1,5 +1,5 @@
 /**
- * "Renter" is the assignment terminology for the `customer` database role.
+ * "Renter" is the assignment terminology for the customer database role.
  * Must run after verifyToken so req.user contains verified token claims.
  */
 export function verifyRenter(req, res, next) {
