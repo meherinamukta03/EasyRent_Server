@@ -2,9 +2,13 @@ import express from 'express';
 import cors from 'cors'
 import 'dotenv/config'
 import Stripe from 'stripe';
-import crypto from 'node:crypto';
 
 import { MongoClient, ObjectId } from 'mongodb';
+
+import { verifyToken } from './middleware/verifyToken.js';
+import { verifyRenter } from './middleware/verifyRenter.js';
+import { verifyOwner } from './middleware/verifyOwner.js';
+import { verifyAdmin } from './middleware/verifyAdmin.js';
 
 
 const app = express();
@@ -23,7 +27,11 @@ const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').repla
 app.post('/webhooks/stripe', express.raw({ type: 'application/json' }), handleStripeWebhook);
 
 app.use(express.json())
-app.use(cors())
+app.use(cors({
+  origin: FRONTEND_URL,
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}))
 
 const client = new MongoClient(`mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.nafjga5.mongodb.net/`);
 export async function connectToMongoDB() {
@@ -74,36 +82,14 @@ function toISO(value) {
   return null;
 }
 
-/**
- * Admin endpoints are called only by the Next.js server, which has already
- * verified the Better Auth session and the admin role. This header is an
- * independent server-to-server check: a browser can never supply it because
- * the value lives only in the two server environments.
- */
-function requireAdmin(req, res, next) {
-  const expected = process.env.ADMIN_API_SECRET || "";
-  const provided = getString(req.get("x-admin-api-secret"));
+/** Reusable middleware chains for each role. */
+const customerAuth = [verifyToken, verifyRenter];
+const ownerAuth = [verifyToken, verifyOwner];
+const adminAuth = [verifyToken, verifyAdmin];
 
-  if (!expected || !provided) {
-    return res.status(401).send({ message: "Unauthorized" });
-  }
-
-  const expectedBuffer = Buffer.from(expected);
-  const providedBuffer = Buffer.from(provided);
-
-  if (
-    expectedBuffer.length !== providedBuffer.length ||
-    !crypto.timingSafeEqual(expectedBuffer, providedBuffer)
-  ) {
-    return res.status(401).send({ message: "Unauthorized" });
-  }
-
-  return next();
-}
-
-/** The admin id is forwarded from the verified Next.js session. */
+/** The acting identity always comes from the verified JWT. */
 function getActingAdminId(req) {
-  return getString(req.get("x-admin-user-id"));
+  return req.user?.id || "";
 }
 
 function sendApiError(res, error, fallback) {
@@ -256,10 +242,19 @@ app.get('/', (req, res) => {
   res.send('hello from the server');
 });
 
-app.get('/users', async(req, res) => {
-const user=users.find({})
-const result=await user.toArray()
-  res.send(result);
+// Legacy endpoint. It is not used by the frontend, but it used to return raw
+// user documents. Keep the response shape while removing authentication data
+// (password hashes, account and session references) from every response.
+app.get('/users', ...adminAuth, async(req, res) => {
+  try {
+    const result = await users
+      .find({}, { projection: SAFE_USER_PROJECTION })
+      .toArray();
+
+    res.send(result.map(toAdminUserDto));
+  } catch (error) {
+    return sendApiError(res, error, "Failed to load users");
+  }
 });
 
 
@@ -301,16 +296,31 @@ app.get('/public/recent-equipments', async (req, res) => {
 
 
 
-app.post('/equipments',async(req,res)=>{
-  // Stamp new listings so the public catalogue can order them by creation
-  // time. Older documents without this field are handled by the sort in
-  // GET /public/equipments via the _id tiebreaker.
-  const job = {
-    ...req.body,
-    createdAt: new Date().toISOString()
-  };
+app.post('/equipments', ...ownerAuth, async(req,res)=>{
+  try {
+    // Ownership is taken from the verified JWT, never from the request body.
+    const owner = await users.findOne(
+      { email: req.user.email },
+      { projection: { name: 1 } }
+    );
+    const payload = { ...req.body };
+    delete payload.ownerName;
+
+    const job = {
+      ...payload,
+      ownerInfo: {
+        name: String(owner?.name || ""),
+        email: req.user.email,
+      },
+      status: "Pending",
+      createdAt: new Date().toISOString()
+    };
+
     const result = await equipments.insertOne(job);
-    res.send(result);
+    res.status(201).send(result);
+  } catch (error) {
+    return sendApiError(res, error, "Failed to add equipment");
+  }
 })
 
 function getQueryString(value) {
@@ -326,11 +336,10 @@ function escapeRegex(value) {
 }
 
 
-app.get("/equipments", async (req, res) => {
-  const email = req.query.email;
-
+app.get("/equipments", ...ownerAuth, async (req, res) => {
+  // Ignore any ?email= supplied by the browser: the JWT is authoritative.
   const result = await equipments.find({
-    "ownerInfo.email": email
+    "ownerInfo.email": req.user.email
   }).toArray();
 
   res.send(result);
@@ -529,10 +538,9 @@ app.post('/public/contact', async (req, res) => {
 });
 
 
-app.patch('/equipments/:id', async (req, res) => {
+app.patch('/equipments/:id', ...ownerAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const ownerEmail = req.body?.ownerEmail;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({
@@ -540,18 +548,13 @@ app.patch('/equipments/:id', async (req, res) => {
       });
     }
 
-    if (!ownerEmail) {
-      return res.status(401).send({
-        message: "Owner email is required"
-      });
-    }
-
     const updates = buildEquipmentUpdates(req.body);
 
+    // The owner filter uses only the verified token identity.
     const result = await equipments.findOneAndUpdate(
       {
         _id: new ObjectId(id),
-        "ownerInfo.email": ownerEmail
+        "ownerInfo.email": req.user.email
       },
       {
         $set: updates
@@ -577,10 +580,9 @@ app.patch('/equipments/:id', async (req, res) => {
   }
 });
 
-app.delete('/equipments/:id', async (req, res) => {
+app.delete('/equipments/:id', ...ownerAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const ownerEmail = req.query.email;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({
@@ -588,15 +590,9 @@ app.delete('/equipments/:id', async (req, res) => {
       });
     }
 
-    if (!ownerEmail) {
-      return res.status(401).send({
-        message: "Owner email is required"
-      });
-    }
-
     const query = {
       _id: new ObjectId(id),
-      "ownerInfo.email": ownerEmail
+      "ownerInfo.email": req.user.email
     };
 
     const result = await equipments.deleteOne(query);
@@ -622,9 +618,10 @@ app.delete('/equipments/:id', async (req, res) => {
 });
 
 
-app.get("/owner/rentals", async (req, res) => {
+app.get("/owner/rentals", ...ownerAuth, async (req, res) => {
   try {
-    const email = req.query.email;
+    // The owner identity comes from the verified JWT, not from the query.
+    const email = req.user.email;
 
     await syncRentalProgress();
 
@@ -663,14 +660,9 @@ function getString(value) {
   return typeof value === "string" ? value.trim() : "";
 }
 
-app.get("/favorites", async (req, res) => {
+app.get("/favorites", ...customerAuth, async (req, res) => {
   try {
-    const customerEmail = getQueryString(req.query.email);
-
-    if (!customerEmail) {
-      return res.status(400).send({ message: "Customer email is required" });
-    }
-
+    const customerEmail = req.user.email;
     const equipmentId = getQueryString(req.query.equipmentId);
     const query = { customerEmail };
 
@@ -688,10 +680,10 @@ app.get("/favorites", async (req, res) => {
   }
 });
 
-app.post("/favorites", async (req, res) => {
+app.post("/favorites", ...customerAuth, async (req, res) => {
   try {
-    const customerEmail = getString(req.body?.customerEmail);
-    const customerId = getString(req.body?.customerId);
+    const customerEmail = req.user.email;
+    const customerId = req.user.id;
     const equipmentId = getString(req.body?.equipmentId);
     const equipment = req.body?.equipment;
 
@@ -729,12 +721,12 @@ app.post("/favorites", async (req, res) => {
   }
 });
 
-app.delete("/favorites", async (req, res) => {
+app.delete("/favorites", ...customerAuth, async (req, res) => {
   try {
-    const customerEmail = getQueryString(req.query.email);
+    const customerEmail = req.user.email;
     const equipmentId = getQueryString(req.query.equipmentId);
 
-    if (!customerEmail || !equipmentId) {
+    if (!equipmentId) {
       return res.status(400).send({ message: "Invalid favorite data" });
     }
 
@@ -1031,11 +1023,23 @@ function validateBookingInput(body) {
   };
 }
 
-app.post("/bookings", async (req, res) => {
+app.post("/bookings", ...customerAuth, async (req, res) => {
   const session = client.startSession();
 
   try {
-    const input = validateBookingInput(req.body);
+    const customer = await users.findOne(
+      { email: req.user.email },
+      { projection: { name: 1 } }
+    );
+
+    // Identity fields are injected from the verified token, so a client cannot
+    // create a booking on behalf of another customer.
+    const input = validateBookingInput({
+      ...req.body,
+      customerEmail: req.user.email,
+      customerId: req.user.id,
+      customerName: customer?.name || "",
+    });
     let booking = null;
 
     await session.withTransaction(
@@ -1141,17 +1145,13 @@ app.post("/bookings", async (req, res) => {
 // Creates a Stripe Checkout Session from a stored booking. No amount or
 // equipment data is accepted from the browser here — everything is re-read
 // from the booking document that was created by the validated booking API.
-app.post("/create-checkout-session", async (req, res) => {
+app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
   try {
     const bookingId = getString(req.body?.bookingId);
-    const customerEmail = getString(req.body?.customerEmail);
+    const customerEmail = req.user.email;
 
     if (!bookingId || !ObjectId.isValid(bookingId)) {
       return res.status(400).send({ message: "Invalid booking ID" });
-    }
-
-    if (!customerEmail) {
-      return res.status(401).send({ message: "Customer identity is required" });
     }
 
     const booking = await rentalsCollection.findOne({
@@ -1258,11 +1258,11 @@ app.post("/create-checkout-session", async (req, res) => {
  * session id, booking id, amount and currency are all checked against Stripe
  * and the stored booking. Safe to call repeatedly.
  */
-app.post('/verify-payment', async (req, res) => {
+app.post('/verify-payment', ...customerAuth, async (req, res) => {
   try {
     const bookingId = getString(req.body?.bookingId);
     const sessionId = getString(req.body?.sessionId);
-    const customerEmail = getString(req.body?.customerEmail);
+    const customerEmail = req.user.email;
 
     if (!bookingId || !ObjectId.isValid(bookingId) || !sessionId || !customerEmail) {
       return res.status(400).send({ message: 'Invalid payment verification request' });
@@ -1340,16 +1340,13 @@ app.post('/verify-payment', async (req, res) => {
 
 // Owner accepts a paid, pending booking. The ownerEmail filter makes the
 // update atomic and ensures only the owner of the equipment can change it.
-app.post('/bookings/:id/accept', async (req, res) => {
+app.post('/bookings/:id/accept', ...ownerAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const ownerEmail = getString(req.body?.ownerEmail);
+    const ownerEmail = req.user.email;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({ message: 'Invalid booking ID' });
-    }
-    if (!ownerEmail) {
-      return res.status(401).send({ message: 'Owner identity is required' });
     }
 
     const objectId = new ObjectId(id);
@@ -1388,16 +1385,13 @@ app.post('/bookings/:id/accept', async (req, res) => {
 // Owner rejects an eligible pending booking. A Stripe refund is attempted for
 // paid bookings, and paymentStatus becomes Refunded only when Stripe confirms
 // the refund succeeded.
-app.post('/bookings/:id/reject', async (req, res) => {
+app.post('/bookings/:id/reject', ...ownerAuth, async (req, res) => {
   try {
     const id = req.params.id;
-    const ownerEmail = getString(req.body?.ownerEmail);
+    const ownerEmail = req.user.email;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({ message: 'Invalid booking ID' });
-    }
-    if (!ownerEmail) {
-      return res.status(401).send({ message: 'Owner identity is required' });
     }
 
     const objectId = new ObjectId(id);
@@ -1478,13 +1472,10 @@ app.post('/bookings/:id/reject', async (req, res) => {
   }
 });
 
-app.get("/customer/rentals", async (req, res) => {
+app.get("/customer/rentals", ...customerAuth, async (req, res) => {
   try {
-    const customerEmail = getQueryString(req.query.email);
-
-    if (!customerEmail) {
-      return res.status(400).send({ message: "Customer email is required" });
-    }
+    // Never trust a query email: bookings are scoped to the JWT identity.
+    const customerEmail = req.user.email;
 
     await syncRentalProgress();
 
@@ -1616,7 +1607,7 @@ function toAdminUserDto(doc) {
   };
 }
 
-app.get("/admin/users", requireAdmin, async (req, res) => {
+app.get("/admin/users", ...adminAuth, async (req, res) => {
   try {
     const query = {};
     const search = getQueryString(req.query.search);
@@ -1642,19 +1633,22 @@ app.get("/admin/users", requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/admin/users/:id/role", requireAdmin, async (req, res) => {
+app.patch("/admin/users/:id/role", ...adminAuth, async (req, res) => {
   try {
     const id = getString(req.params.id);
     const role = getString(req.body?.role);
     const actingAdminId = getActingAdminId(req);
 
-    if (!id) throw new ApiError(400, "Invalid user ID");
+    if (!id || !ObjectId.isValid(id)) throw new ApiError(400, "Invalid user ID");
     if (!USER_ROLES.includes(role)) {
       throw new ApiError(400, "Please choose a valid role");
     }
 
+    // Better Auth stores user _id as an ObjectId, while the DTO exposes it as
+    // a hex string. Convert before querying or the lookup always misses.
+    const objectId = new ObjectId(id);
     const user = await users.findOne(
-      { _id: id },
+      { _id: objectId },
       { projection: SAFE_USER_PROJECTION }
     );
 
@@ -1668,7 +1662,7 @@ app.patch("/admin/users/:id/role", requireAdmin, async (req, res) => {
     }
 
     const updated = await users.findOneAndUpdate(
-      { _id: id },
+      { _id: objectId },
       { $set: { role, updatedAt: new Date().toISOString() } },
       { returnDocument: "after", projection: SAFE_USER_PROJECTION }
     );
@@ -1684,18 +1678,19 @@ app.patch("/admin/users/:id/role", requireAdmin, async (req, res) => {
   }
 });
 
-app.delete("/admin/users/:id", requireAdmin, async (req, res) => {
+app.delete("/admin/users/:id", ...adminAuth, async (req, res) => {
   try {
     const id = getString(req.params.id);
     const actingAdminId = getActingAdminId(req);
 
-    if (!id) throw new ApiError(400, "Invalid user ID");
+    if (!id || !ObjectId.isValid(id)) throw new ApiError(400, "Invalid user ID");
     if (id === actingAdminId) {
       throw new ApiError(409, "You cannot delete your own account");
     }
 
+    const objectId = new ObjectId(id);
     const user = await users.findOne(
-      { _id: id },
+      { _id: objectId },
       { projection: SAFE_USER_PROJECTION }
     );
 
@@ -1708,12 +1703,16 @@ app.delete("/admin/users/:id", requireAdmin, async (req, res) => {
       }
     }
 
+    // Some Better Auth versions store userId as a string, others as ObjectId.
+    // Match both so no session or account survives an account deletion.
+    const ownerFilter = { $in: [objectId, id] };
+
     await Promise.all([
-      sessionsCollection.deleteMany({ userId: id }),
-      accountsCollection.deleteMany({ userId: id }),
+      sessionsCollection.deleteMany({ userId: ownerFilter }),
+      accountsCollection.deleteMany({ userId: ownerFilter }),
     ]);
 
-    const result = await users.deleteOne({ _id: id });
+    const result = await users.deleteOne({ _id: objectId });
 
     if (result.deletedCount === 0) throw new ApiError(404, "User not found");
 
@@ -1726,7 +1725,7 @@ app.delete("/admin/users/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/admin/equipments", requireAdmin, async (req, res) => {
+app.get("/admin/equipments", ...adminAuth, async (req, res) => {
   try {
     const query = {};
     const status = getQueryString(req.query.status);
@@ -1757,7 +1756,7 @@ app.get("/admin/equipments", requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/admin/equipments/:id/status", requireAdmin, async (req, res) => {
+app.patch("/admin/equipments/:id/status", ...adminAuth, async (req, res) => {
   try {
     const id = getString(req.params.id);
     const status = getString(req.body?.status);
@@ -1793,7 +1792,7 @@ app.patch("/admin/equipments/:id/status", requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/admin/equipments/:id", requireAdmin, async (req, res) => {
+app.patch("/admin/equipments/:id", ...adminAuth, async (req, res) => {
   try {
     const id = getString(req.params.id);
 
@@ -1821,7 +1820,7 @@ app.patch("/admin/equipments/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.delete("/admin/equipments/:id", requireAdmin, async (req, res) => {
+app.delete("/admin/equipments/:id", ...adminAuth, async (req, res) => {
   try {
     const id = getString(req.params.id);
 
@@ -1842,7 +1841,7 @@ app.delete("/admin/equipments/:id", requireAdmin, async (req, res) => {
   }
 });
 
-app.get("/admin/rentals", requireAdmin, async (req, res) => {
+app.get("/admin/rentals", ...adminAuth, async (req, res) => {
   try {
     await syncRentalProgress();
 
@@ -1922,7 +1921,7 @@ app.get("/admin/rentals", requireAdmin, async (req, res) => {
   }
 });
 
-app.patch("/admin/rentals/:id/booking-status", requireAdmin, async (req, res) => {
+app.patch("/admin/rentals/:id/booking-status", ...adminAuth, async (req, res) => {
   try {
     const id = getString(req.params.id);
     const nextStatus = getString(req.body?.bookingStatus);
@@ -1980,6 +1979,60 @@ app.patch("/admin/rentals/:id/booking-status", requireAdmin, async (req, res) =>
     });
   } catch (error) {
     return sendApiError(res, error, "Failed to update booking status");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Analytics (JWT + role protected)
+// ---------------------------------------------------------------------------
+
+app.get('/owner/analytics', ...ownerAuth, async (req, res) => {
+  try {
+    const email = req.user.email;
+    const rentals = await rentalsCollection
+      .find({ ownerEmail: email })
+      .toArray();
+
+    const equipmentCount = await equipments.countDocuments({
+      "ownerInfo.email": email,
+    });
+
+    res.send({
+      equipmentCount,
+      rentalCount: rentals.length,
+      pendingRequests: rentals.filter((item) => item.bookingStatus === "Pending").length,
+      earnings: rentals
+        .filter((item) => item.paymentStatus === "Paid")
+        .reduce((sum, item) => sum + Number(item.totalAmount || 0), 0),
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to load owner analytics");
+  }
+});
+
+app.get('/admin/analytics', ...adminAuth, async (req, res) => {
+  try {
+    const [userCount, pending, approved, rejected, rentalCount, paidRentals] =
+      await Promise.all([
+        users.countDocuments({}),
+        equipments.countDocuments({ status: "Pending" }),
+        equipments.countDocuments({ status: "Approved" }),
+        equipments.countDocuments({ status: "Rejected" }),
+        rentalsCollection.countDocuments({}),
+        rentalsCollection.find({ paymentStatus: "Paid" }).toArray(),
+      ]);
+
+    res.send({
+      userCount,
+      equipment: { pending, approved, rejected },
+      rentalCount,
+      revenue: paidRentals.reduce(
+        (sum, item) => sum + Number(item.totalAmount || 0),
+        0
+      ),
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to load admin analytics");
   }
 });
 
