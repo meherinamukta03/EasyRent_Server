@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors'
 import 'dotenv/config'
 import Stripe from 'stripe';
+import crypto from 'node:crypto';
 
 import { MongoClient, ObjectId } from 'mongodb';
 
@@ -47,6 +48,131 @@ const rentalsCollection = database.collection("rentals");
 const favoritesCollection = database.collection("favorites");
 const paymentsCollection = database.collection("payments");
 const contactMessagesCollection = database.collection("contactMessages");
+
+// Better Auth stores its sessions and accounts in the same database. The admin
+// API needs these collections to revoke access when an account is removed and
+// to resolve owner/customer names for the rental overview.
+const sessionsCollection = database.collection("session");
+const accountsCollection = database.collection("account");
+
+const USER_ROLES = ["customer", "owner", "admin"];
+
+/** Expected failures carry an HTTP status; everything else becomes a 500. */
+class ApiError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function toISO(value) {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "string") {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString();
+  }
+  return null;
+}
+
+/**
+ * Admin endpoints are called only by the Next.js server, which has already
+ * verified the Better Auth session and the admin role. This header is an
+ * independent server-to-server check: a browser can never supply it because
+ * the value lives only in the two server environments.
+ */
+function requireAdmin(req, res, next) {
+  const expected = process.env.ADMIN_API_SECRET || "";
+  const provided = getString(req.get("x-admin-api-secret"));
+
+  if (!expected || !provided) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  const expectedBuffer = Buffer.from(expected);
+  const providedBuffer = Buffer.from(provided);
+
+  if (
+    expectedBuffer.length !== providedBuffer.length ||
+    !crypto.timingSafeEqual(expectedBuffer, providedBuffer)
+  ) {
+    return res.status(401).send({ message: "Unauthorized" });
+  }
+
+  return next();
+}
+
+/** The admin id is forwarded from the verified Next.js session. */
+function getActingAdminId(req) {
+  return getString(req.get("x-admin-user-id"));
+}
+
+function sendApiError(res, error, fallback) {
+  if (error instanceof ApiError) {
+    return res.status(error.status).send({ message: error.message });
+  }
+
+  console.error(error);
+  return res.status(500).send({ message: fallback });
+}
+
+const EQUIPMENT_EDITABLE_FIELDS = [
+  "name",
+  "description",
+  "category",
+  "location",
+  "rentalPrice",
+  "rentalType",
+  "quantity",
+  "condition",
+  "brand",
+  "model",
+  "terms",
+  "image",
+];
+
+/** Shared validation for both the owner and the admin equipment update. */
+function buildEquipmentUpdates(body) {
+  const updates = {};
+
+  for (const field of EQUIPMENT_EDITABLE_FIELDS) {
+    if (body?.[field] !== undefined && body[field] !== null) {
+      updates[field] = body[field];
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    throw new ApiError(400, "No editable fields were provided");
+  }
+
+  if (updates.rentalPrice !== undefined) {
+    const price = Number(updates.rentalPrice);
+    if (!Number.isFinite(price) || price < 1) {
+      throw new ApiError(400, "Rental price must be a positive number");
+    }
+    updates.rentalPrice = price;
+  }
+
+  if (updates.quantity !== undefined) {
+    const quantity = Number(updates.quantity);
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      throw new ApiError(400, "Quantity must be a positive whole number");
+    }
+    updates.quantity = quantity;
+  }
+
+  return updates;
+}
+
+/**
+ * Booking transitions an administrator is allowed to perform. Everything else
+ * stays with the existing workflow: payment is verified by Stripe, the owner
+ * accepts/confirms, and the server syncs Active/Completed from the dates.
+ */
+const ADMIN_BOOKING_TRANSITIONS = {
+  Pending: ["Cancelled", "Rejected"],
+  Confirmed: ["Cancelled"],
+  Active: ["Completed"],
+};
 
 // One favorite per equipment per customer.
 favoritesCollection
@@ -420,34 +546,7 @@ app.patch('/equipments/:id', async (req, res) => {
       });
     }
 
-    const editableFields = [
-      "name",
-      "description",
-      "category",
-      "location",
-      "rentalPrice",
-      "rentalType",
-      "quantity",
-      "condition",
-      "brand",
-      "model",
-      "terms",
-      "image"
-    ];
-
-    const updates = {};
-
-    for (const field of editableFields) {
-      if (req.body[field] !== undefined && req.body[field] !== null) {
-        updates[field] = req.body[field];
-      }
-    }
-
-    if (Object.keys(updates).length === 0) {
-      return res.status(400).send({
-        message: "No editable fields were provided"
-      });
-    }
+    const updates = buildEquipmentUpdates(req.body);
 
     const result = await equipments.findOneAndUpdate(
       {
@@ -474,11 +573,7 @@ app.patch('/equipments/:id', async (req, res) => {
     });
 
   } catch (error) {
-    console.log(error);
-
-    res.status(500).send({
-      message: "Failed to update equipment"
-    });
+    return sendApiError(res, error, "Failed to update equipment");
   }
 });
 
@@ -563,13 +658,6 @@ app.get("/owner/rentals", async (req, res) => {
 // ---------------------------------------------------------------------------
 // Customer favorites
 // ---------------------------------------------------------------------------
-
-class ApiError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
 
 function getString(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -1412,9 +1500,7 @@ app.get("/customer/rentals", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------------
 // Public equipment details and availability
-// ---------------------------------------------------------------------------
 
 app.get("/public/equipments/:id", async (req, res) => {
   try {
@@ -1497,6 +1583,403 @@ app.get("/public/equipments/:id/availability", async (req, res) => {
     console.log(error);
 
     res.status(500).send({ message: "Failed to check availability" });
+  }
+});
+
+
+// Admin API
+const SAFE_USER_PROJECTION = {
+  _id: 1,
+  name: 1,
+  email: 1,
+  role: 1,
+  phone: 1,
+  address: 1,
+  image: 1,
+  emailVerified: 1,
+  createdAt: 1,
+  updatedAt: 1,
+};
+
+function toAdminUserDto(doc) {
+  return {
+    id: String(doc._id),
+    name: getString(doc.name),
+    email: getString(doc.email),
+    role: USER_ROLES.includes(doc.role) ? doc.role : "customer",
+    phone: getString(doc.phone),
+    address: getString(doc.address),
+    image: typeof doc.image === "string" ? doc.image : null,
+    emailVerified: Boolean(doc.emailVerified),
+    createdAt: toISO(doc.createdAt),
+    updatedAt: toISO(doc.updatedAt),
+  };
+}
+
+app.get("/admin/users", requireAdmin, async (req, res) => {
+  try {
+    const query = {};
+    const search = getQueryString(req.query.search);
+    const role = getQueryString(req.query.role);
+
+    if (search) {
+      const pattern = escapeRegex(search);
+      query.$or = [
+        { name: { $regex: pattern, $options: "i" } },
+        { email: { $regex: pattern, $options: "i" } },
+      ];
+    }
+    if (USER_ROLES.includes(role)) query.role = role;
+
+    const docs = await users
+      .find(query, { projection: SAFE_USER_PROJECTION })
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    res.send({ users: docs.map(toAdminUserDto), total: docs.length });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to load users");
+  }
+});
+
+app.patch("/admin/users/:id/role", requireAdmin, async (req, res) => {
+  try {
+    const id = getString(req.params.id);
+    const role = getString(req.body?.role);
+    const actingAdminId = getActingAdminId(req);
+
+    if (!id) throw new ApiError(400, "Invalid user ID");
+    if (!USER_ROLES.includes(role)) {
+      throw new ApiError(400, "Please choose a valid role");
+    }
+
+    const user = await users.findOne(
+      { _id: id },
+      { projection: SAFE_USER_PROJECTION }
+    );
+
+    if (!user) throw new ApiError(404, "User not found");
+
+    // An admin cannot remove their own admin access. This is checked again
+    // here (not only in the Next.js action) so the rule holds even if the
+    // trusted caller forwards a different acting id.
+    if (id === actingAdminId && role !== "admin") {
+      throw new ApiError(409, "You cannot change your own admin role");
+    }
+
+    const updated = await users.findOneAndUpdate(
+      { _id: id },
+      { $set: { role, updatedAt: new Date().toISOString() } },
+      { returnDocument: "after", projection: SAFE_USER_PROJECTION }
+    );
+
+    if (!updated) throw new ApiError(404, "User not found");
+
+    res.send({
+      message: "User role updated successfully",
+      user: toAdminUserDto(updated),
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to update user role");
+  }
+});
+
+app.delete("/admin/users/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = getString(req.params.id);
+    const actingAdminId = getActingAdminId(req);
+
+    if (!id) throw new ApiError(400, "Invalid user ID");
+    if (id === actingAdminId) {
+      throw new ApiError(409, "You cannot delete your own account");
+    }
+
+    const user = await users.findOne(
+      { _id: id },
+      { projection: SAFE_USER_PROJECTION }
+    );
+
+    if (!user) throw new ApiError(404, "User not found");
+
+    if (user.role === "admin") {
+      const adminCount = await users.countDocuments({ role: "admin" });
+      if (adminCount <= 1) {
+        throw new ApiError(409, "The last admin account cannot be deleted");
+      }
+    }
+
+    await Promise.all([
+      sessionsCollection.deleteMany({ userId: id }),
+      accountsCollection.deleteMany({ userId: id }),
+    ]);
+
+    const result = await users.deleteOne({ _id: id });
+
+    if (result.deletedCount === 0) throw new ApiError(404, "User not found");
+
+    res.send({
+      message: "User deleted successfully",
+      result: { deletedCount: result.deletedCount },
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to delete user");
+  }
+});
+
+app.get("/admin/equipments", requireAdmin, async (req, res) => {
+  try {
+    const query = {};
+    const status = getQueryString(req.query.status);
+    const search = getQueryString(req.query.search);
+
+    if (["Pending", "Approved", "Rejected"].includes(status)) {
+      query.status = status;
+    }
+    if (search) {
+      const pattern = escapeRegex(search);
+      query.$or = [
+        { name: { $regex: pattern, $options: "i" } },
+        { "ownerInfo.email": { $regex: pattern, $options: "i" } },
+      ];
+    }
+
+    const docs = await equipments
+      .find(query)
+      .sort({ createdAt: -1, _id: -1 })
+      .toArray();
+
+    res.send({
+      equipments: docs.map((item) => ({ ...item, _id: String(item._id) })),
+      total: docs.length,
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to load equipment");
+  }
+});
+
+app.patch("/admin/equipments/:id/status", requireAdmin, async (req, res) => {
+  try {
+    const id = getString(req.params.id);
+    const status = getString(req.body?.status);
+
+    if (!id || !ObjectId.isValid(id)) {
+      throw new ApiError(400, "Invalid equipment ID");
+    }
+    if (!["Pending", "Approved", "Rejected"].includes(status)) {
+      throw new ApiError(400, "Please choose a valid equipment status");
+    }
+
+    const updated = await equipments.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status,
+          updatedAt: new Date().toISOString(),
+          reviewedAt: new Date().toISOString(),
+          reviewedBy: getActingAdminId(req) || "admin",
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (!updated) throw new ApiError(404, "Equipment not found");
+
+    res.send({
+      message: `Equipment ${status.toLowerCase()} successfully`,
+      equipment: { ...updated, _id: String(updated._id) },
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to update equipment status");
+  }
+});
+
+app.patch("/admin/equipments/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = getString(req.params.id);
+
+    if (!id || !ObjectId.isValid(id)) {
+      throw new ApiError(400, "Invalid equipment ID");
+    }
+
+    const updates = buildEquipmentUpdates(req.body);
+    updates.updatedAt = new Date().toISOString();
+
+    const updated = await equipments.findOneAndUpdate(
+      { _id: new ObjectId(id) },
+      { $set: updates },
+      { returnDocument: "after" }
+    );
+
+    if (!updated) throw new ApiError(404, "Equipment not found");
+
+    res.send({
+      message: "Equipment updated successfully",
+      equipment: { ...updated, _id: String(updated._id) },
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to update equipment");
+  }
+});
+
+app.delete("/admin/equipments/:id", requireAdmin, async (req, res) => {
+  try {
+    const id = getString(req.params.id);
+
+    if (!id || !ObjectId.isValid(id)) {
+      throw new ApiError(400, "Invalid equipment ID");
+    }
+
+    const result = await equipments.deleteOne({ _id: new ObjectId(id) });
+
+    if (result.deletedCount === 0) throw new ApiError(404, "Equipment not found");
+
+    res.send({
+      message: "Equipment deleted successfully",
+      result: { deletedCount: result.deletedCount },
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to delete equipment");
+  }
+});
+
+app.get("/admin/rentals", requireAdmin, async (req, res) => {
+  try {
+    await syncRentalProgress();
+
+    const query = {};
+    const bookingStatus = getQueryString(req.query.bookingStatus);
+    const paymentStatus = getQueryString(req.query.paymentStatus);
+    const search = getQueryString(req.query.search);
+
+    if (bookingStatus) query.bookingStatus = bookingStatus;
+    if (paymentStatus) query.paymentStatus = paymentStatus;
+    if (search) {
+      const pattern = escapeRegex(search);
+      query.$or = [
+        { customerEmail: { $regex: pattern, $options: "i" } },
+        { ownerEmail: { $regex: pattern, $options: "i" } },
+        { equipmentName: { $regex: pattern, $options: "i" } },
+      ];
+    }
+
+    const requestedPage = Number.parseInt(getQueryString(req.query.page), 10);
+    const requestedLimit = Number.parseInt(getQueryString(req.query.limit), 10);
+    const page = Number.isFinite(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+    const limit =
+      Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(Math.floor(requestedLimit), 50)
+        : 10;
+
+    const [docs, total] = await Promise.all([
+      rentalsCollection
+        .find(query)
+        .sort({ createdAt: -1, _id: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+      rentalsCollection.countDocuments(query),
+    ]);
+
+    
+    const emails = new Set();
+    for (const doc of docs) {
+      if (doc.customerEmail) emails.add(String(doc.customerEmail).toLowerCase());
+      if (doc.ownerEmail) emails.add(String(doc.ownerEmail).toLowerCase());
+    }
+
+    const nameDocs = emails.size
+      ? await users
+          .find({ email: { $in: [...emails] } }, { projection: { name: 1, email: 1, _id: 0 } })
+          .toArray()
+      : [];
+
+    const nameByEmail = new Map(
+      nameDocs.map((item) => [getString(item.email).toLowerCase(), getString(item.name)])
+    );
+
+    const rentals = docs.map((doc) => ({
+      ...doc,
+      _id: String(doc._id),
+      equipmentId: doc.equipmentId ? String(doc.equipmentId) : doc.equipmentIdString || undefined,
+      customerName:
+        getString(doc.customerName) ||
+        nameByEmail.get(String(doc.customerEmail || "").toLowerCase()) ||
+        "",
+      ownerName: nameByEmail.get(String(doc.ownerEmail || "").toLowerCase()) || "",
+      createdAt: toISO(doc.createdAt),
+      paidAt: toISO(doc.paidAt),
+    }));
+
+    res.send({
+      rentals,
+      total,
+      page,
+      limit,
+      pages: Math.max(1, Math.ceil(total / limit)),
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to load rentals");
+  }
+});
+
+app.patch("/admin/rentals/:id/booking-status", requireAdmin, async (req, res) => {
+  try {
+    const id = getString(req.params.id);
+    const nextStatus = getString(req.body?.bookingStatus);
+
+    if (!id || !ObjectId.isValid(id)) {
+      throw new ApiError(400, "Invalid booking ID");
+    }
+
+    const objectId = new ObjectId(id);
+    const booking = await rentalsCollection.findOne({ _id: objectId });
+
+    if (!booking) throw new ApiError(404, "Booking not found");
+
+    const currentStatus = getString(booking.bookingStatus) || "Pending";
+    const allowed = ADMIN_BOOKING_TRANSITIONS[currentStatus] || [];
+
+    if (!allowed.includes(nextStatus)) {
+      throw new ApiError(
+        409,
+        `Cannot change a ${currentStatus.toLowerCase()} booking to ${nextStatus.toLowerCase() || "that status"}`
+      );
+    }
+
+    if (
+      ["Cancelled", "Rejected"].includes(nextStatus) &&
+      booking.paymentStatus === "Paid"
+    ) {
+      throw new ApiError(
+        409,
+        "Paid bookings must be handled through the refund workflow"
+      );
+    }
+
+    const now = new Date().toISOString();
+    const updated = await rentalsCollection.findOneAndUpdate(
+      { _id: objectId, bookingStatus: currentStatus },
+      {
+        $set: {
+          bookingStatus: nextStatus,
+          updatedAt: now,
+          ...(nextStatus === "Cancelled" ? { cancelledAt: now } : {}),
+          reviewedBy: getActingAdminId(req) || "admin",
+        },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (!updated) {
+      throw new ApiError(409, "This booking changed. Refresh and try again.");
+    }
+
+    res.send({
+      message: `Booking marked ${nextStatus.toLowerCase()} successfully`,
+      booking: { ...updated, _id: String(updated._id) },
+    });
+  } catch (error) {
+    return sendApiError(res, error, "Failed to update booking status");
   }
 });
 
