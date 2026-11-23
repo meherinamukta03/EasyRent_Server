@@ -157,8 +157,106 @@ function buildEquipmentUpdates(body) {
 const ADMIN_BOOKING_TRANSITIONS = {
   Pending: ["Cancelled", "Rejected"],
   Confirmed: ["Cancelled"],
-  Active: ["Completed"],
+  Active: ["Completed", "Returned"],
+  Returned: [],
 };
+
+/**
+ * Only confirmed/active rentals occupy physical inventory. Pending (unpaid),
+ * failed and cancelled bookings never reduce stock permanently.
+ */
+const INVENTORY_RESERVING_STATUSES = ["Confirmed", "Active"];
+
+function equipmentIdFilter(id) {
+  const objectId = new ObjectId(id);
+  return { $in: [objectId, String(id)] };
+}
+
+/** Reserved units for a rental period, computed from confirmed bookings only. */
+async function reservedForPeriod(id, startISO, endISO, session) {
+  const bookings = await rentalsCollection
+    .find(
+      {
+        equipmentId: equipmentIdFilter(id),
+        bookingStatus: { $in: INVENTORY_RESERVING_STATUSES },
+        rentalStartDate: { $lt: endISO },
+        rentalEndDate: { $gt: startISO },
+      },
+      { session }
+    )
+    .toArray();
+
+  return bookings.reduce(
+    (total, item) => total + Number(item.requiredQuantity || 0),
+    0
+  );
+}
+
+/** All currently reserved units, regardless of dates. */
+async function reservedAll(id, session) {
+  const bookings = await rentalsCollection
+    .find(
+      {
+        equipmentId: equipmentIdFilter(id),
+        bookingStatus: { $in: INVENTORY_RESERVING_STATUSES },
+      },
+      { session }
+    )
+    .toArray();
+
+  return bookings.reduce(
+    (total, item) => total + Number(item.requiredQuantity || 0),
+    0
+  );
+}
+
+/**
+ * Ensures the denormalized availableQuantity counter exists. Older listings
+ * created before this counter are initialized from real reservations once.
+ */
+async function ensureInventoryCounter(id, session) {
+  const equipment = await equipments.findOne(
+    { _id: new ObjectId(id), availableQuantity: { $exists: false } },
+    { session }
+  );
+
+  if (!equipment) return;
+
+  const reserved = await reservedAll(id, session);
+  const available = Math.max(0, Number(equipment.quantity || 0) - reserved);
+
+  await equipments.updateOne(
+    { _id: new ObjectId(id), availableQuantity: { $exists: false } },
+    { $set: { availableQuantity: available } },
+    { session }
+  );
+}
+
+/**
+ * Returns one unit batch to inventory, at most once per booking. The flag is
+ * set atomically so cancellation + return (or repeated clicks) cannot double
+ * restore stock.
+ */
+async function restoreInventory(booking, session) {
+  const updated = await rentalsCollection.findOneAndUpdate(
+    {
+      _id: booking._id,
+      inventoryRestored: { $ne: true },
+    },
+    { $set: { inventoryRestored: true, restoredAt: new Date().toISOString() } },
+    { returnDocument: "after", session }
+  );
+
+  if (!updated) return false;
+
+  await equipments.updateOne(
+    { _id: booking.equipmentId },
+    { $inc: { availableQuantity: Number(booking.requiredQuantity || 0) } },
+    { session }
+  );
+
+  return true;
+}
 
 // One favorite per equipment per customer.
 favoritesCollection
@@ -184,10 +282,8 @@ async function syncRentalProgress() {
     { $set: { bookingStatus: "Active", updatedAt: now } }
   );
 
-  await rentalsCollection.updateMany(
-    { bookingStatus: "Active", rentalEndDate: { $lte: now } },
-    { $set: { bookingStatus: "Completed", updatedAt: now } }
-  );
+  // Active rentals are NOT auto-completed on the end date: inventory returns
+  // only after the owner explicitly confirms the equipment is back.
 }
 
 /** Writes payment details once and keeps the rental document in sync. */
@@ -312,6 +408,7 @@ app.post('/equipments', ...ownerAuth, async(req,res)=>{
         name: String(owner?.name || ""),
         email: req.user.email,
       },
+      availableQuantity: Number(payload.quantity) || 0,
       status: "Pending",
       createdAt: new Date().toISOString()
     };
@@ -432,7 +529,14 @@ app.get('/public/equipments', async (req, res) => {
 
     const result = await resultQuery.toArray();
 
-    res.send(result);
+    res.send(
+      result.map((item) => ({
+        ...item,
+        availableQuantity: Number(
+          item.availableQuantity ?? item.quantity ?? 0
+        ),
+      }))
+    );
 
   } catch (error) {
     console.log(error);
@@ -1054,28 +1158,29 @@ app.post("/bookings", ...customerAuth, async (req, res) => {
         const startISO = input.start.toISOString();
         const endISO = input.end.toISOString();
 
-        // Overlapping bookings still reserve stock for their whole period.
-        const activeBookings = await rentalsCollection
-          .find(
-            {
-              equipmentId: new ObjectId(input.equipmentId),
-              bookingStatus: { $nin: ["Cancelled", "Rejected", "Completed"] },
-              rentalStartDate: { $lte: endISO },
-              rentalEndDate: { $gte: startISO },
-            },
-            { session }
-          )
-          .toArray();
+        // Only confirmed/active rentals reserve stock. Pending payments never
+        // reduce inventory, and failed/cancelled bookings are ignored.
+        await ensureInventoryCounter(input.equipmentId, session);
 
-        const reserved = activeBookings.reduce(
-          (total, item) => total + Number(item.requiredQuantity || 0),
-          0
+        const reserved = await reservedForPeriod(
+          input.equipmentId,
+          startISO,
+          endISO,
+          session
         );
 
-        if (reserved + input.requiredQuantity > stock) {
+        const periodAvailable = Math.max(0, stock - reserved);
+        const storedAvailable = Number(equipment.availableQuantity ?? stock);
+        const bookable = Math.min(periodAvailable, Math.max(0, storedAvailable));
+
+        if (bookable < 1) {
+          throw new ApiError(409, "This equipment is currently unavailable");
+        }
+
+        if (input.requiredQuantity > bookable) {
           throw new ApiError(
             409,
-            `Only ${Math.max(0, stock - reserved)} unit(s) available for this period`
+            `Only ${bookable} unit(s) available for this period`
           );
         }
 
@@ -1333,45 +1438,112 @@ app.post('/verify-payment', ...customerAuth, async (req, res) => {
 // Owner accepts a paid, pending booking. The ownerEmail filter makes the
 // update atomic and ensures only the owner of the equipment can change it.
 app.post('/bookings/:id/accept', ...ownerAuth, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const ownerEmail = req.user.email;
+  const id = req.params.id;
+  const ownerEmail = req.user.email;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: 'Invalid booking ID' });
-    }
-
-    const objectId = new ObjectId(id);
-    const now = new Date().toISOString();
-
-    const updated = await rentalsCollection.findOneAndUpdate(
-      {
-        _id: objectId,
-        ownerEmail,
-        paymentStatus: 'Paid',
-        bookingStatus: 'Pending',
-      },
-      { $set: { bookingStatus: 'Confirmed', acceptedAt: now, updatedAt: now } },
-      { returnDocument: 'after' }
-    );
-
-    if (!updated) {
-      const existing = await rentalsCollection.findOne({ _id: objectId, ownerEmail });
-
-      if (!existing) {
-        return res.status(404).send({ message: 'Booking not found for this owner' });
-      }
-      if (existing.paymentStatus !== 'Paid') {
-        return res.status(409).send({ message: 'Payment must be completed before accepting' });
-      }
-      return res.status(409).send({ message: 'Only pending bookings can be accepted' });
-    }
-
-    return res.send({ message: 'Booking accepted successfully', booking: updated });
-  } catch (error) {
-    console.error('Accept booking error:', error);
-    return res.status(500).send({ message: 'Failed to accept booking' });
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: 'Invalid booking ID' });
   }
+
+  const objectId = new ObjectId(id);
+  const now = new Date().toISOString();
+  const session = client.startSession();
+  let updated = null;
+
+  try {
+    await session.withTransaction(async () => {
+      const booking = await rentalsCollection.findOne(
+        { _id: objectId, ownerEmail },
+        { session }
+      );
+
+      if (!booking) throw new ApiError(404, 'Booking not found for this owner');
+      if (booking.paymentStatus !== 'Paid') {
+        throw new ApiError(409, 'Payment must be completed before accepting');
+      }
+      if (booking.bookingStatus !== 'Pending') {
+        throw new ApiError(409, 'Only pending bookings can be accepted');
+      }
+
+      const equipmentId = String(
+        booking.equipmentIdString || booking.equipmentId
+      );
+      if (!ObjectId.isValid(equipmentId)) {
+        throw new ApiError(400, 'Invalid equipment ID');
+      }
+
+      await ensureInventoryCounter(equipmentId, session);
+
+      const equipment = await equipments.findOne(
+        { _id: new ObjectId(equipmentId) },
+        { session }
+      );
+      const startISO = new Date(booking.rentalStartDate).toISOString();
+      const endISO = new Date(booking.rentalEndDate).toISOString();
+      const reserved = await reservedForPeriod(
+        equipmentId,
+        startISO,
+        endISO,
+        session
+      );
+      const quantity = Number(booking.requiredQuantity || 0);
+      const periodAvailable = Math.max(
+        0,
+        Number(equipment?.quantity || 0) - reserved
+      );
+      const storedAvailable = Number(equipment?.availableQuantity ?? 0);
+
+      if (storedAvailable < quantity || periodAvailable < quantity) {
+        throw new ApiError(
+          409,
+          `Only ${Math.min(storedAvailable, periodAvailable)} unit(s) available for this period`
+        );
+      }
+
+      // Atomic guard: inventory can never go negative.
+      const decremented = await equipments.findOneAndUpdate(
+        {
+          _id: new ObjectId(equipmentId),
+          availableQuantity: { $gte: quantity },
+        },
+        { $inc: { availableQuantity: -quantity } },
+        { returnDocument: 'after', session }
+      );
+
+      if (!decremented) {
+        throw new ApiError(409, 'Not enough available quantity');
+      }
+
+      // Atomic status guard: concurrent accepts cannot both confirm.
+      updated = await rentalsCollection.findOneAndUpdate(
+        {
+          _id: objectId,
+          ownerEmail,
+          paymentStatus: 'Paid',
+          bookingStatus: 'Pending',
+        },
+        {
+          $set: {
+            bookingStatus: 'Confirmed',
+            acceptedAt: now,
+            updatedAt: now,
+            inventoryReserved: true,
+          },
+        },
+        { returnDocument: 'after', session }
+      );
+
+      if (!updated) {
+        throw new ApiError(409, 'Only pending bookings can be accepted');
+      }
+    }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
+  } catch (error) {
+    return sendApiError(res, error, 'Failed to accept booking');
+  } finally {
+    await session.endSession();
+  }
+
+  return res.send({ message: 'Booking accepted successfully', booking: updated });
 });
 
 // Owner rejects an eligible pending booking. A Stripe refund is attempted for
@@ -1464,6 +1636,65 @@ app.post('/bookings/:id/reject', ...ownerAuth, async (req, res) => {
   }
 });
 
+/**
+ * Owner confirms that a rented item is back and available again. Inventory is
+ * restored at most once per booking via the atomic inventoryRestored flag.
+ */
+app.post('/bookings/:id/return', ...ownerAuth, async (req, res) => {
+  const id = req.params.id;
+  const ownerEmail = req.user.email;
+
+  if (!ObjectId.isValid(id)) {
+    return res.status(400).send({ message: 'Invalid booking ID' });
+  }
+
+  const session = client.startSession();
+  let updated = null;
+
+  try {
+    await session.withTransaction(async () => {
+      const booking = await rentalsCollection.findOne(
+        { _id: new ObjectId(id), ownerEmail },
+        { session }
+      );
+
+      if (!booking) throw new ApiError(404, 'Booking not found for this owner');
+      if (!['Confirmed', 'Active'].includes(booking.bookingStatus)) {
+        throw new ApiError(409, 'Only active rentals can be marked as returned');
+      }
+
+      updated = await rentalsCollection.findOneAndUpdate(
+        {
+          _id: booking._id,
+          ownerEmail,
+          bookingStatus: booking.bookingStatus,
+        },
+        {
+          $set: {
+            bookingStatus: 'Returned',
+            returnConfirmedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        },
+        { returnDocument: 'after', session }
+      );
+
+      if (!updated) throw new ApiError(409, 'This booking changed. Refresh and try again.');
+
+      await restoreInventory(updated, session);
+    }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
+  } catch (error) {
+    return sendApiError(res, error, 'Failed to mark rental as returned');
+  } finally {
+    await session.endSession();
+  }
+
+  return res.send({
+    message: 'Equipment marked as returned. Quantity restored.',
+    booking: updated,
+  });
+});
+
 app.get("/customer/rentals", ...customerAuth, async (req, res) => {
   try {
     // Never trust a query email: bookings are scoped to the JWT identity.
@@ -1502,7 +1733,12 @@ app.get("/public/equipments/:id", async (req, res) => {
       return res.status(404).send({ message: "Equipment not found" });
     }
 
-    res.send(equipment);
+    res.send({
+      ...equipment,
+      availableQuantity: Number(
+        equipment.availableQuantity ?? equipment.quantity ?? 0
+      ),
+    });
   } catch (error) {
     console.log(error);
 
@@ -1540,24 +1776,21 @@ app.get("/public/equipments/:id/availability", async (req, res) => {
       });
     }
 
-    const activeBookings = await rentalsCollection
-      .find({
-        equipmentId: new ObjectId(id),
-        bookingStatus: { $nin: ["Cancelled", "Rejected", "Completed"] },
-        rentalStartDate: { $lte: start.toISOString() },
-        rentalEndDate: { $gte: end.toISOString() },
-      })
-      .toArray();
-
-    const reserved = activeBookings.reduce(
-      (total, item) => total + Number(item.requiredQuantity || 0),
-      0
+    const reserved = await reservedForPeriod(
+      id,
+      start.toISOString(),
+      end.toISOString()
     );
     const stock = Number(equipment.quantity || 0);
-    const availableQuantity = Math.max(0, stock - reserved);
+    const periodAvailable = Math.max(0, stock - reserved);
+    const storedAvailable = Number(
+      equipment.availableQuantity ?? periodAvailable
+    );
+    const availableQuantity = Math.min(periodAvailable, Math.max(0, storedAvailable));
 
     res.send({
       stock,
+      totalQuantity: stock,
       reserved,
       availableQuantity,
       available: availableQuantity > 0,
@@ -1963,6 +2196,13 @@ app.patch("/admin/rentals/:id/booking-status", ...adminAuth, async (req, res) =>
 
     if (!updated) {
       throw new ApiError(409, "This booking changed. Refresh and try again.");
+    }
+
+    if (
+      ["Cancelled", "Rejected", "Returned"].includes(nextStatus) &&
+      INVENTORY_RESERVING_STATUSES.includes(currentStatus)
+    ) {
+      await restoreInventory(updated);
     }
 
     res.send({
