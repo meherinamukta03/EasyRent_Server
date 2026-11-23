@@ -18,7 +18,9 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
-const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || 'usd').toLowerCase();
+// Prices in the app are entered and displayed in Bangladeshi Taka (৳), so
+// Stripe must charge in BDT too — otherwise 150 means $150, not ৳150.
+const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || 'bdt').toLowerCase();
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
 
 // Stripe needs the exact raw body to verify signatures, so this route is
@@ -1269,7 +1271,8 @@ app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
     }
 
     // Reuse an open session so repeated clicks never create duplicate charges.
-    if (booking.stripeSessionId) {
+    // A session created with an older currency (e.g. USD) must not be reused.
+    if (booking.stripeSessionId && booking.stripeCurrency === STRIPE_CURRENCY) {
       try {
         const existing = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
 
@@ -1288,7 +1291,7 @@ app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
       }
     }
 
-    const currency = booking.stripeCurrency || STRIPE_CURRENCY;
+    const currency = STRIPE_CURRENCY;
     const amount = Number(booking.totalAmount);
 
     if (!Number.isFinite(amount) || amount <= 0) {
