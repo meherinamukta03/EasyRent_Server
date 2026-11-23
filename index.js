@@ -18,8 +18,8 @@ const stripe = process.env.STRIPE_SECRET_KEY
   ? new Stripe(process.env.STRIPE_SECRET_KEY)
   : null;
 
-// Prices in the app are entered and displayed in Bangladeshi Taka (৳), so
-// Stripe must charge in BDT too — otherwise 150 means $150, not ৳150.
+// Prices in the app are stored/displayed in BDT (৳). Charge in BDT directly,
+// so ৳150 on the details page is exactly ৳150.00 on Stripe — no conversion.
 const STRIPE_CURRENCY = (process.env.STRIPE_CURRENCY || 'bdt').toLowerCase();
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
 
@@ -320,7 +320,7 @@ async function recordPaidBooking(booking, session, currency, paidAt) {
         customerId: booking.customerId || "",
         customerEmail: booking.customerEmail || "",
         equipmentId: (booking.equipmentIdString || booking.equipmentId || "").toString(),
-        amount: booking.totalAmount,
+        amount: getChargedAmount(booking),
         currency,
         paymentStatus: "Paid",
         stripeSessionId: session.id,
@@ -871,6 +871,14 @@ function toStripeMinorUnits(amount, currency) {
   return Math.round(Number(amount) * multiplier);
 }
 
+/** The amount stored at checkout, reused when verifying payment. */
+function getChargedAmount(booking) {
+  if (Number.isFinite(booking?.stripeAmount) && booking.stripeAmount > 0) {
+    return booking.stripeAmount;
+  }
+  return Number(booking?.totalAmount);
+}
+
 /**
  * When no webhook signing secret is configured, re-fetch the event object
  * from Stripe itself. The payload is only used for the event id/type; all
@@ -963,7 +971,10 @@ async function handleStripeWebhook(req, res) {
       }
 
       const expectedCurrency = booking.stripeCurrency || STRIPE_CURRENCY;
-      const expectedAmount = toStripeMinorUnits(booking.totalAmount, expectedCurrency);
+      const expectedAmount = toStripeMinorUnits(
+        getChargedAmount(booking),
+        expectedCurrency
+      );
 
       if (
         session.currency !== expectedCurrency ||
@@ -1270,9 +1281,21 @@ app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
       return res.status(500).send({ message: "Stripe is not configured" });
     }
 
-    // Reuse an open session so repeated clicks never create duplicate charges.
-    // A session created with an older currency (e.g. USD) must not be reused.
-    if (booking.stripeSessionId && booking.stripeCurrency === STRIPE_CURRENCY) {
+    const currency = STRIPE_CURRENCY;
+    // Exactly the price shown on the details page — no conversion.
+    const amount = Number(booking.totalAmount);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).send({ message: "Invalid booking amount" });
+    }
+
+    // Reuse an open session only when the amount/currency still match. An old
+    // session created with a different currency must not be reused.
+    if (
+      booking.stripeSessionId &&
+      booking.stripeCurrency === currency &&
+      booking.stripeAmount === amount
+    ) {
       try {
         const existing = await stripe.checkout.sessions.retrieve(booking.stripeSessionId);
 
@@ -1291,18 +1314,12 @@ app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
       }
     }
 
-    const currency = STRIPE_CURRENCY;
-    const amount = Number(booking.totalAmount);
-
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).send({ message: "Invalid booking amount" });
-    }
-
     const metadata = {
       bookingId: booking._id.toString(),
       customerId: booking.customerId || '',
       equipmentId: (booking.equipmentIdString || booking.equipmentId || '').toString(),
       customerEmail: booking.customerEmail || '',
+      bdtAmount: amount.toString(),
     };
 
     const session = await stripe.checkout.sessions.create({
@@ -1316,7 +1333,7 @@ app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
             unit_amount: toStripeMinorUnits(amount, currency),
             product_data: {
               name: booking.equipmentName || 'Equipment rental',
-              description: `${booking.rentalDuration || 0} ${booking.rentalType || 'Daily'} rental`,
+              description: `${booking.rentalDuration || 0} ${booking.rentalType || 'Daily'} rental (৳${amount})`,
             },
           },
           quantity: 1,
@@ -1338,6 +1355,8 @@ app.post("/create-checkout-session", ...customerAuth, async (req, res) => {
         $set: {
           stripeSessionId: session.id,
           stripeCurrency: currency,
+          stripeAmount: amount,
+          stripeBdtAmount: amount,
           stripeCheckoutUrl: session.url,
           paymentStatus: 'Pending',
           updatedAt: new Date().toISOString(),
@@ -1403,7 +1422,10 @@ app.post('/verify-payment', ...customerAuth, async (req, res) => {
     }
 
     const expectedCurrency = booking.stripeCurrency || STRIPE_CURRENCY;
-    const expectedAmount = toStripeMinorUnits(booking.totalAmount, expectedCurrency);
+    const expectedAmount = toStripeMinorUnits(
+      getChargedAmount(booking),
+      expectedCurrency
+    );
 
     const paid =
       session.payment_status === 'paid' &&
